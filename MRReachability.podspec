@@ -8,7 +8,7 @@ Pod::Spec.new do |s|
   DESC
   s.homepage     = 'https://github.com/mrsool/MRReachability'
   s.license      = { :type => 'MIT', :file => 'LICENSE' }
-  s.author       = { 'Rao Uvais' => 'rao.khan@mrsool.com' }
+  s.author       = { 'Rao Uvais' => 'rao.khan@mrsool.co' }
   s.source       = { :git => 'https://github.com/mrsool/MRReachability.git', :tag => s.version }
 
   s.ios.deployment_target = '13.0'
