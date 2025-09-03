@@ -1,0 +1,4 @@
+
+# Xcode/SwiftPM user junk
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+*.xcuserstate
