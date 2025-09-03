@@ -1,15 +1,5 @@
 // MRReachability.swift
 // NWPathMonitor-backed, legacy-style Reachability surface.
-// Works on iOS 12+
-//
-// Notes for Swift 6:
-// - Immutable global constants (no shared mutable state)
-// - Class isolated to MainActor (UI-friendly notifications/callbacks)
-// - Enum is Sendable
-// - NWPathMonitor callback hops to MainActor via Task { @MainActor in … }
-
-// MRReachability.swift
-// NWPathMonitor-backed, legacy-style Reachability surface.
 // Supported: iOS 12+ / macOS 10.14+ / tvOS 12+ / watchOS 5+
 //
 // Swift 6 compatibility:
@@ -34,18 +24,18 @@ import SystemConfiguration
 
 // Public version symbols (compat with older Reachability headers)
 public let ReachabilityVersionNumber: Double = 1.0
-public let ReachabilityVersionString: String = "MRReachability 1.0.3"
+public let ReachabilityVersionString: String = "MRReachability 1.0.4"
 
 public extension Notification.Name {
     static let reachabilityChanged = Notification.Name("reachabilityChanged")
 }
 
 @available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
-public final class MRReachability: @unchecked Sendable, CustomStringConvertible {
+public final class Reachability: @unchecked Sendable, CustomStringConvertible {
 
     // MARK: - Legacy callback aliases
-    public typealias NetworkReachable   = (MRReachability) -> Void
-    public typealias NetworkUnreachable = (MRReachability) -> Void
+    public typealias NetworkReachable   = (Reachability) -> Void
+    public typealias NetworkUnreachable = (Reachability) -> Void
 
     // MARK: - Connection (legacy 3-state), Sendable for Swift 6
     public enum Connection: String, Sendable, CustomStringConvertible {
@@ -85,23 +75,22 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         self.host = hostname
     }
 
+    #if canImport(SystemConfiguration)
     /// Legacy SCNetworkReachability initializer placeholder (kept for source compatibility)
     public convenience init?(_ reachabilityRef: SCNetworkReachability?) {
         self.init()
     }
+    #endif
 
     // MARK: - Notifier lifecycle
     public func startNotifier() throws {
         guard !notifierRunning else { return }
 
-        // NOTE: pathUpdateHandler is @Sendable. We capture `self` weakly and bounce to main queue
-        // before touching any state or calling user callbacks (UI-friendly).
+        // Ensure mapping happens on the main queue to avoid races on allowsCellularConnection
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let strongSelf = self else { return }
-            let status = Self.map(path: path, allowsCellular: strongSelf.allowsCellularConnection)
-
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
+                let status = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
                 self.lastStatus = status
 
                 switch status {
