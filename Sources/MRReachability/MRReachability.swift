@@ -56,7 +56,7 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
     public var allowsCellularConnection: Bool = true
 
     /// Optional debounce to smooth brief flaps (e.g., during Wi-Fi ⇄ Cellular handoff).
-    /// Set to 0 (default) to disable.
+    /// Set to 0 to disable. Default = 0.2s.
     public var debounceInterval: TimeInterval = 0.2
 
     /// Callbacks (always invoked on main queue).
@@ -96,39 +96,9 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
     public func startNotifier() throws {
         guard !notifierRunning else { return }
 
-        // Path updates arrive on 'queue'; we hop to main before touching state or callbacks.
+        // Path updates arrive on 'queue'
         monitor.pathUpdateHandler = { [weak self] path in
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-
-                let newStatus = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
-                self.lastStatus = newStatus
-
-                // Distinct-until-changed + optional debounce
-                let fire: () -> Void = {
-                    // Only notify when the public-facing status actually changes
-                    guard newStatus != self.lastNotifiedStatus else { return }
-                    self.lastNotifiedStatus = newStatus
-
-                    switch newStatus {
-                    case .unavailable:
-                        self.whenUnreachable?(self)
-                    case .wifi, .cellular:
-                        self.whenReachable?(self)
-                    }
-
-                    NotificationCenter.default.post(name: .reachabilityChanged, object: self)
-                }
-
-                if self.debounceInterval > 0 {
-                    self.debounceWorkItem?.cancel()
-                    let work = DispatchWorkItem(block: fire)
-                    self.debounceWorkItem = work
-                    DispatchQueue.main.asyncAfter(deadline: .now() + self.debounceInterval, execute: work)
-                } else {
-                    fire()
-                }
-            }
+            self?.handlePathUpdate(path)
         }
 
         monitor.start(queue: queue)
@@ -149,6 +119,57 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
     deinit {
         // Safe to call from deinit; we don’t require @MainActor here.
         stopNotifier()
+    }
+
+    // MARK: - Handler helpers
+
+    /// Bounce to main before touching any state or invoking callbacks.
+    private func handlePathUpdate(_ path: NWPath) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.processPathOnMain(path)
+        }
+    }
+
+    /// Compute new status, cache it, and schedule notification work.
+    private func processPathOnMain(_ path: NWPath) {
+        let status = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
+        self.lastStatus = status
+        self.scheduleNotifyIfNeeded(for: status)
+    }
+
+    /// Distinct-until-changed + optional debounce.
+    private func scheduleNotifyIfNeeded(for status: Connection) {
+        // Only notify when public-facing status actually changes
+        guard status != self.lastNotifiedStatus else { return }
+
+        let fireNow = { [weak self] in
+            guard let self = self else { return }
+            // Re-check in case something flipped during debounce
+            guard status != self.lastNotifiedStatus else { return }
+            self.lastNotifiedStatus = status
+            self.fireCallbacksAndNotification(for: status)
+        }
+
+        if debounceInterval > 0 {
+            debounceWorkItem?.cancel()
+            let item = DispatchWorkItem(block: fireNow)
+            debounceWorkItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + debounceInterval, execute: item)
+        } else {
+            fireNow()
+        }
+    }
+
+    /// Invoke user callbacks and post NotificationCenter event (always on main).
+    private func fireCallbacksAndNotification(for status: Connection) {
+        switch status {
+        case .unavailable:
+            self.whenUnreachable?(self)
+        case .wifi, .cellular:
+            self.whenReachable?(self)
+        }
+        NotificationCenter.default.post(name: .reachabilityChanged, object: self)
     }
 
     // MARK: - Internals
