@@ -11,6 +11,7 @@
 //  - Availability is scoped on the class so older platforms compile apps that include this file,
 //    but the type itself is only available where Network.framework exists.
 
+
 import Foundation
 import Network
 
@@ -23,7 +24,7 @@ import SystemConfiguration
 #endif
 
 public let ReachabilityVersionNumber: Double = 1.0
-public let ReachabilityVersionString: String = "MRReachability 1.0.4"
+public let ReachabilityVersionString: String = "MRReachability 1.0.5"
 
 public extension Notification.Name {
     static let reachabilityChanged = Notification.Name("reachabilityChanged")
@@ -31,29 +32,6 @@ public extension Notification.Name {
 
 @available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
 public final class MRReachability: @unchecked Sendable, CustomStringConvertible {
-
-    // MARK: - Stored Properties (Grouped Up)
-
-    // Public configuration
-    public var allowsCellularConnection: Bool = true
-    public var debounceInterval: TimeInterval = 0.2
-    public var retryAttempts: Int = 2
-    public var retryBackoff: TimeInterval = 1.0
-    public var enableDebugLogging: Bool = false
-    public var notificationCooldown: TimeInterval = 5.0
-
-    public var whenReachable: NetworkReachable?
-    public var whenUnreachable: NetworkUnreachable?
-
-    // Private internals
-    private let monitor: NWPathMonitor
-    private let queue: DispatchQueue
-    private var notifierRunning: Bool = false
-    private var lastStatus: Connection?
-    private var lastNotifiedStatus: Connection?
-    private var lastNotificationTime: Date?
-    private var debounceWorkItem: DispatchWorkItem?
-    private var host: String?
 
     // MARK: - Public Types
 
@@ -69,6 +47,50 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         public var description: String { rawValue }
     }
 
+    // MARK: - Public configuration
+
+    public var allowsCellularConnection: Bool = true
+    public var debounceInterval: TimeInterval = 0.2
+    public var retryAttempts: Int = 2
+    public var retryBackoff: TimeInterval = 1.0
+    public var enableDebugLogging: Bool = false
+    public var notificationCooldown: TimeInterval = 5.0
+
+    /// Strict mode: only mark reachable when HTTP probe succeeds.
+    public var requireInternetProbe: Bool = true
+
+    /// Probe endpoint (Google 204 by default) — replace with your own if needed.
+    public var probeURL: URL? = URL(string: "https://www.google.com/generate_204")
+
+    /// Probe timeout (seconds).
+    public var probeTimeout: TimeInterval = 4.0
+
+    /// If true, only HTTP 204 is accepted (classic captive-portal detection).
+    /// If false (default), we use a lenient-but-safe rule below.
+    public var requireExact204ForProbe: Bool = false
+
+    public var whenReachable: NetworkReachable?
+    public var whenUnreachable: NetworkUnreachable?
+
+    // MARK: - Private internals
+
+    private let queue: DispatchQueue
+    private var monitor: NWPathMonitor
+    private var notifierRunning: Bool = false
+
+    private var lastStatus: Connection?
+    private var lastNotifiedStatus: Connection?
+    private var lastNotificationTime: Date?
+    private var debounceWorkItem: DispatchWorkItem?
+    private var host: String?
+
+    /// Prevent redundant concurrent probes on rapid path flips.
+    private var probeInFlight: Bool = false
+
+    // MARK: - Surface
+
+    /// Current connection state. Uses the cached lastStatus if known;
+    /// otherwise maps from NWPath (which may be optimistic prior to probe).
     public var connection: Connection {
         if let cached = lastStatus { return cached }
         return Self.map(path: monitor.currentPath, allowsCellular: allowsCellularConnection)
@@ -85,7 +107,7 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
 
     public convenience init?(hostname: String) {
         self.init()
-        self.host = hostname
+        self.host = hostname // retained for compatibility
     }
 
     #if canImport(SystemConfiguration)
@@ -107,17 +129,30 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
 
         monitor.start(queue: queue)
         notifierRunning = true
+
+        if enableDebugLogging {
+            print("[MRReachability] ▶️ Notifier started (v\(ReachabilityVersionString))")
+        }
     }
 
     public func stopNotifier() {
         guard notifierRunning else { return }
         monitor.cancel()
         notifierRunning = false
+
         lastStatus = nil
         lastNotifiedStatus = nil
         lastNotificationTime = nil
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
+        probeInFlight = false
+
+        // Recreate monitor for clean restarts (more reliable on some OSes)
+        monitor = NWPathMonitor()
+
+        if enableDebugLogging {
+            print("[MRReachability] ⏹ Notifier stopped")
+        }
     }
 
     // MARK: - Path Update + Internet Check
@@ -129,16 +164,53 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
     }
 
     private func processPathOnMain(_ path: NWPath) {
-        let status = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
-        self.lastStatus = status
+        let mapped = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
 
-        // Internet check before notifying
-        if status != .unavailable {
-            self.checkInternetAvailability(retries: retryAttempts) { [weak self] isReachable in
-                self?.scheduleNotifyIfNeeded(for: isReachable ? status : .unavailable)
+        if enableDebugLogging {
+            let usesWiFi = path.usesInterfaceType(.wifi)
+            let usesCell = path.usesInterfaceType(.cellular)
+            let usesEth  = path.usesInterfaceType(.wiredEthernet)
+            if #available(macOS 10.15, *) {
+                print("[MRReachability] Path=\(path.status) | wifi:\(usesWiFi) cell:\(usesCell) eth:\(usesEth) constrained:\(path.isConstrained) expensive:\(path.isExpensive) → mapped:\(mapped)")
             }
-        } else {
-            self.scheduleNotifyIfNeeded(for: .unavailable)
+        }
+
+        // If NWPath says unavailable, finalize immediately
+        guard mapped != .unavailable else {
+            self.lastStatus = .unavailable                    // ✅ final truth
+            scheduleNotifyIfNeeded(for: .unavailable)
+            return
+        }
+
+        // If not requiring probe, trust NWPath and finalize now
+        guard requireInternetProbe, probeURL != nil else {
+            self.lastStatus = mapped                          // ✅ final truth
+            scheduleNotifyIfNeeded(for: mapped)
+            return
+        }
+
+        // Coalesce: avoid redundant concurrent probes.
+        guard !probeInFlight else {
+            if enableDebugLogging {
+                print("[MRReachability] ⏳ Probe already in flight; skipping duplicate")
+            }
+            return
+        }
+        probeInFlight = true
+
+        // Probe the internet before confirming "connected"
+        checkInternetAvailability(retries: retryAttempts) { [weak self] isReachable in
+            guard let self else { return }
+            self.probeInFlight = false
+
+            let finalStatus: Connection = isReachable ? mapped : .unavailable
+            self.lastStatus = finalStatus                     // ✅ final truth BEFORE notifying
+
+            if self.enableDebugLogging {
+                print("[MRReachability] Probe result: \(isReachable ? "reachable ✅" : "unreachable ❌") → final:\(finalStatus)")
+            }
+
+            self.scheduleNotifyIfNeeded(for: finalStatus)
         }
     }
 
@@ -151,7 +223,7 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
 
         if sameAsLast && cooldownNotMet {
             if enableDebugLogging {
-                print("[MRReachability] ⏱ Skipping duplicate '\(status)' notification (cooldown active)")
+                print("[MRReachability] ⏱ Skipping duplicate '\(status)' (cooldown)")
             }
             return
         }
@@ -175,7 +247,7 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
 
     private func fireCallbacksAndNotification(for status: Connection) {
         if enableDebugLogging {
-            print("[MRReachability] 🔔 Status changed to: \(status)")
+            print("[MRReachability] 🔔 Status → \(status)")
         }
 
         switch status {
@@ -188,51 +260,56 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         NotificationCenter.default.post(name: .reachabilityChanged, object: self)
     }
 
-    // MARK: - Internet Reachability Check with Retry
+    // MARK: - Internet Reachability Check with Retry (Captive-portal-safe)
 
     private func checkInternetAvailability(retries: Int, completion: @escaping (Bool) -> Void) {
-        guard let url = URL(string: "https://www.google.com/generate_204") else {
-            completion(false)
-            return
-        }
+        guard let url = probeURL else { completion(false); return }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 2
-        request.httpMethod = "HEAD"
+        request.timeoutInterval = probeTimeout
+        request.httpMethod = "GET" // HEAD is flaky behind proxies/captive portals
 
         if enableDebugLogging {
-            print("[MRReachability] 🌐 Checking internet... Attempt \(retryAttempts - retries + 1)")
+            print("[MRReachability] 🌐 Probe attempt \(retryAttempts - retries + 1) → \(url.absoluteString)")
         }
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
-            let success: Bool
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            let http = response as? HTTPURLResponse
+            let code = http?.statusCode ?? -1
 
-            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 204 {
-                success = true
-            } else if let data = data, !data.isEmpty {
-                success = true
+            // Captive-portal avoidance:
+            let finalURLHost = http?.url?.host?.lowercased()
+            let originalHost = url.host?.lowercased()
+            let isRedirected = (finalURLHost != nil && originalHost != nil && finalURLHost != originalHost)
+            let isHtml = (http?.mimeType?.lowercased() == "text/html")
+
+            let success: Bool
+            if self?.requireExact204ForProbe == true {
+                // Strict mode: only 204 counts
+                success = (code == 204)
             } else {
-                success = false
+                // Lenient-but-safe:
+                let okCode = (200...204).contains(code)
+                let sameHost = !isRedirected
+                let hasBody = (data?.isEmpty == false)
+                success = okCode && sameHost && !isHtml && (code == 204 || hasBody || code == 200 || code == 201 || code == 202 || code == 203)
             }
 
             if success {
-                DispatchQueue.main.async {
-                    if self?.enableDebugLogging == true {
-                        print("[MRReachability] ✅ Internet is reachable.")
-                    }
-                    completion(true)
-                }
+                DispatchQueue.main.async { completion(true) }
             } else if retries > 0 {
-                DispatchQueue.global().asyncAfter(deadline: .now() + (self?.retryBackoff ?? 1)) {
+                let delay = self?.retryBackoff ?? 1.0
+                if self?.enableDebugLogging == true {
+                    print("[MRReachability] 🔁 Probe failed (code \(code), redirected:\(isRedirected), html:\(isHtml), err:\(String(describing: error))) — retrying in \(delay)s")
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                     self?.checkInternetAvailability(retries: retries - 1, completion: completion)
                 }
             } else {
-                DispatchQueue.main.async {
-                    if self?.enableDebugLogging == true {
-                        print("[MRReachability] ❌ Internet check failed after all retries.")
-                    }
-                    completion(false)
+                if self?.enableDebugLogging == true {
+                    print("[MRReachability] ❌ Probe failed after all retries (code \(code), redirected:\(isRedirected), html:\(isHtml), err:\(String(describing: error)))")
                 }
+                DispatchQueue.main.async { completion(false) }
             }
         }.resume()
     }
