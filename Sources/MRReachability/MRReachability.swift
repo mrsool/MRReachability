@@ -22,10 +22,8 @@ import UIKit
 import SystemConfiguration
 #endif
 
-// Public version symbols (compat with older Reachability headers)
-// NOTE: keep this in sync with your Git tag if you care about logging parity.
 public let ReachabilityVersionNumber: Double = 1.0
-public let ReachabilityVersionString: String = "MRReachability 1.0.2"
+public let ReachabilityVersionString: String = "MRReachability 1.0.3"
 
 public extension Notification.Name {
     static let reachabilityChanged = Notification.Name("reachabilityChanged")
@@ -34,36 +32,17 @@ public extension Notification.Name {
 @available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
 public final class MRReachability: @unchecked Sendable, CustomStringConvertible {
 
-    // MARK: - Legacy callback aliases
-    public typealias NetworkReachable   = (MRReachability) -> Void
-    public typealias NetworkUnreachable = (MRReachability) -> Void
+    // MARK: - Public API (Stored properties grouped)
 
-    // MARK: - Connection (legacy 3-state), Sendable for Swift 6
-    public enum Connection: String, Sendable, CustomStringConvertible {
-        case unavailable
-        case wifi
-        case cellular
-
-        // Some legacy code expects 'none'
-        public static let none: Connection = .unavailable
-
-        public var description: String { rawValue }
-    }
-
-    // MARK: - Public API
-
-    /// If false, cellular routes are treated as .unavailable.
     public var allowsCellularConnection: Bool = true
-
-    /// Optional debounce to smooth brief flaps (e.g., during Wi-Fi ⇄ Cellular handoff).
-    /// Set to 0 to disable. Default = 0.2s.
     public var debounceInterval: TimeInterval = 0.2
+    public var retryAttempts: Int = 2
+    public var retryBackoff: TimeInterval = 1.0
+    public var enableDebugLogging: Bool = false
 
-    /// Callbacks (always invoked on main queue).
-    public var whenReachable:   NetworkReachable?
+    public var whenReachable: NetworkReachable?
     public var whenUnreachable: NetworkUnreachable?
 
-    /// Current connection (best-effort if notifier not started yet).
     public var connection: Connection {
         if let cached = lastStatus { return cached }
         return Self.map(path: monitor.currentPath, allowsCellular: allowsCellularConnection)
@@ -71,36 +50,45 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
 
     public var description: String { connection.description }
 
-    // MARK: - Init (legacy surface kept)
+    // MARK: - Types
+
+    public typealias NetworkReachable = (MRReachability) -> Void
+    public typealias NetworkUnreachable = (MRReachability) -> Void
+
+    public enum Connection: String, Sendable, CustomStringConvertible {
+        case unavailable
+        case wifi
+        case cellular
+
+        public static let none: Connection = .unavailable
+        public var description: String { rawValue }
+    }
+
+    // MARK: - Init
 
     public init?() {
         self.monitor = NWPathMonitor()
-        self.queue   = DispatchQueue(label: "com.mrsool.reachability.monitor")
+        self.queue = DispatchQueue(label: "com.mrsool.reachability.monitor")
     }
 
-    /// Legacy hostname initializer (kept for source compat; NWPathMonitor is not host-specific).
     public convenience init?(hostname: String) {
         self.init()
         self.host = hostname
     }
 
     #if canImport(SystemConfiguration)
-    /// Legacy SCNetworkReachability initializer placeholder (kept for source compatibility).
     public convenience init?(_ reachabilityRef: SCNetworkReachability?) {
         self.init()
     }
     #endif
 
-    // MARK: - Notifier lifecycle
+    // MARK: - Notifier
 
     public func startNotifier() throws {
         guard !notifierRunning else { return }
-
-        // Path updates arrive on 'queue'
         monitor.pathUpdateHandler = { [weak self] path in
             self?.handlePathUpdate(path)
         }
-
         monitor.start(queue: queue)
         notifierRunning = true
     }
@@ -111,41 +99,38 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         notifierRunning = false
         lastStatus = nil
         lastNotifiedStatus = nil
-
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
     }
 
-    deinit {
-        // Safe to call from deinit; we don’t require @MainActor here.
-        stopNotifier()
-    }
+    deinit { stopNotifier() }
 
-    // MARK: - Handler helpers
+    // MARK: - Path Update
 
-    /// Bounce to main before touching any state or invoking callbacks.
     private func handlePathUpdate(_ path: NWPath) {
         DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.processPathOnMain(path)
+            self?.processPathOnMain(path)
         }
     }
 
-    /// Compute new status, cache it, and schedule notification work.
     private func processPathOnMain(_ path: NWPath) {
         let status = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
         self.lastStatus = status
-        self.scheduleNotifyIfNeeded(for: status)
+
+        if status != .unavailable {
+            self.checkInternetAvailability(retries: retryAttempts) { [weak self] isInternetReachable in
+                self?.scheduleNotifyIfNeeded(for: isInternetReachable ? status : .unavailable)
+            }
+        } else {
+            self.scheduleNotifyIfNeeded(for: .unavailable)
+        }
     }
 
-    /// Distinct-until-changed + optional debounce.
     private func scheduleNotifyIfNeeded(for status: Connection) {
-        // Only notify when public-facing status actually changes
         guard status != self.lastNotifiedStatus else { return }
 
         let fireNow = { [weak self] in
             guard let self = self else { return }
-            // Re-check in case something flipped during debounce
             guard status != self.lastNotifiedStatus else { return }
             self.lastNotifiedStatus = status
             self.fireCallbacksAndNotification(for: status)
@@ -161,8 +146,10 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         }
     }
 
-    /// Invoke user callbacks and post NotificationCenter event (always on main).
     private func fireCallbacksAndNotification(for status: Connection) {
+        if enableDebugLogging {
+            print("[MRReachability] Status changed to: \(status)")
+        }
         switch status {
         case .unavailable:
             self.whenUnreachable?(self)
@@ -170,6 +157,33 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
             self.whenReachable?(self)
         }
         NotificationCenter.default.post(name: .reachabilityChanged, object: self)
+    }
+
+    // MARK: - Internet Check with Retry
+
+    private func checkInternetAvailability(retries: Int, completion: @escaping (Bool) -> Void) {
+        let url = URL(string: "https://www.google.com/generate_204")!
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        request.httpMethod = "HEAD"
+
+        if enableDebugLogging {
+            print("[MRReachability] Performing internet check (\(retryAttempts - retries + 1)/\(retryAttempts))")
+        }
+
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 204 {
+                completion(true)
+            } else {
+                if retries > 0 {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + self!.retryBackoff) {
+                        self?.checkInternetAvailability(retries: retries - 1, completion: completion)
+                    }
+                } else {
+                    completion(false)
+                }
+            }
+        }.resume()
     }
 
     // MARK: - Internals
@@ -183,20 +197,14 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
     private var debounceWorkItem: DispatchWorkItem?
     private var host: String?
 
-    /// Map NWPath → legacy 3-state Connection.
     private static func map(path: NWPath, allowsCellular: Bool) -> Connection {
         guard path.status == .satisfied else { return .unavailable }
-
-        // Treat Wi-Fi and Wired Ethernet both as "wifi" for legacy parity.
         if path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet) {
             return .wifi
         }
-
         if allowsCellular && path.usesInterfaceType(.cellular) {
             return .cellular
         }
-
-        // Satisfied but only loopback/other → unavailable in legacy model.
         return .unavailable
     }
-}
+}  // End
