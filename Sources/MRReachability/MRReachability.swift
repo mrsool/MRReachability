@@ -23,7 +23,7 @@ import SystemConfiguration
 #endif
 
 public let ReachabilityVersionNumber: Double = 1.0
-public let ReachabilityVersionString: String = "MRReachability 1.0.3"
+public let ReachabilityVersionString: String = "MRReachability 1.0.4"
 
 public extension Notification.Name {
     static let reachabilityChanged = Notification.Name("reachabilityChanged")
@@ -32,27 +32,32 @@ public extension Notification.Name {
 @available(iOS 12.0, macOS 10.14, tvOS 12.0, watchOS 5.0, *)
 public final class MRReachability: @unchecked Sendable, CustomStringConvertible {
 
-    // MARK: - Public API (Stored properties grouped)
+    // MARK: - Stored Properties (Grouped Up)
 
+    // Public configuration
     public var allowsCellularConnection: Bool = true
     public var debounceInterval: TimeInterval = 0.2
     public var retryAttempts: Int = 2
     public var retryBackoff: TimeInterval = 1.0
     public var enableDebugLogging: Bool = false
+    public var notificationCooldown: TimeInterval = 5.0
 
     public var whenReachable: NetworkReachable?
     public var whenUnreachable: NetworkUnreachable?
 
-    public var connection: Connection {
-        if let cached = lastStatus { return cached }
-        return Self.map(path: monitor.currentPath, allowsCellular: allowsCellularConnection)
-    }
+    // Private internals
+    private let monitor: NWPathMonitor
+    private let queue: DispatchQueue
+    private var notifierRunning: Bool = false
+    private var lastStatus: Connection?
+    private var lastNotifiedStatus: Connection?
+    private var lastNotificationTime: Date?
+    private var debounceWorkItem: DispatchWorkItem?
+    private var host: String?
 
-    public var description: String { connection.description }
+    // MARK: - Public Types
 
-    // MARK: - Types
-
-    public typealias NetworkReachable = (MRReachability) -> Void
+    public typealias NetworkReachable   = (MRReachability) -> Void
     public typealias NetworkUnreachable = (MRReachability) -> Void
 
     public enum Connection: String, Sendable, CustomStringConvertible {
@@ -64,11 +69,18 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         public var description: String { rawValue }
     }
 
+    public var connection: Connection {
+        if let cached = lastStatus { return cached }
+        return Self.map(path: monitor.currentPath, allowsCellular: allowsCellularConnection)
+    }
+
+    public var description: String { connection.description }
+
     // MARK: - Init
 
     public init?() {
         self.monitor = NWPathMonitor()
-        self.queue = DispatchQueue(label: "com.mrsool.reachability.monitor")
+        self.queue   = DispatchQueue(label: "com.mrsool.reachability.monitor")
     }
 
     public convenience init?(hostname: String) {
@@ -82,13 +94,17 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
     }
     #endif
 
-    // MARK: - Notifier
+    deinit { stopNotifier() }
+
+    // MARK: - Notifier Lifecycle
 
     public func startNotifier() throws {
         guard !notifierRunning else { return }
+
         monitor.pathUpdateHandler = { [weak self] path in
             self?.handlePathUpdate(path)
         }
+
         monitor.start(queue: queue)
         notifierRunning = true
     }
@@ -99,13 +115,12 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         notifierRunning = false
         lastStatus = nil
         lastNotifiedStatus = nil
+        lastNotificationTime = nil
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
     }
 
-    deinit { stopNotifier() }
-
-    // MARK: - Path Update
+    // MARK: - Path Update + Internet Check
 
     private func handlePathUpdate(_ path: NWPath) {
         DispatchQueue.main.async { [weak self] in
@@ -117,22 +132,34 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         let status = Self.map(path: path, allowsCellular: self.allowsCellularConnection)
         self.lastStatus = status
 
+        // Internet check before notifying
         if status != .unavailable {
-            self.checkInternetAvailability(retries: retryAttempts) { [weak self] isInternetReachable in
-                self?.scheduleNotifyIfNeeded(for: isInternetReachable ? status : .unavailable)
+            self.checkInternetAvailability(retries: retryAttempts) { [weak self] isReachable in
+                self?.scheduleNotifyIfNeeded(for: isReachable ? status : .unavailable)
             }
         } else {
             self.scheduleNotifyIfNeeded(for: .unavailable)
         }
     }
 
+    // MARK: - Notification Scheduling with Cooldown Throttle
+
     private func scheduleNotifyIfNeeded(for status: Connection) {
-        guard status != self.lastNotifiedStatus else { return }
+        let now = Date()
+        let sameAsLast = (status == self.lastNotifiedStatus)
+        let cooldownNotMet = (now.timeIntervalSince(lastNotificationTime ?? .distantPast) < notificationCooldown)
+
+        if sameAsLast && cooldownNotMet {
+            if enableDebugLogging {
+                print("[MRReachability] ⏱ Skipping duplicate '\(status)' notification (cooldown active)")
+            }
+            return
+        }
 
         let fireNow = { [weak self] in
             guard let self = self else { return }
-            guard status != self.lastNotifiedStatus else { return }
             self.lastNotifiedStatus = status
+            self.lastNotificationTime = Date()
             self.fireCallbacksAndNotification(for: status)
         }
 
@@ -148,54 +175,69 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
 
     private func fireCallbacksAndNotification(for status: Connection) {
         if enableDebugLogging {
-            print("[MRReachability] Status changed to: \(status)")
+            print("[MRReachability] 🔔 Status changed to: \(status)")
         }
+
         switch status {
         case .unavailable:
             self.whenUnreachable?(self)
         case .wifi, .cellular:
             self.whenReachable?(self)
         }
+
         NotificationCenter.default.post(name: .reachabilityChanged, object: self)
     }
 
-    // MARK: - Internet Check with Retry
+    // MARK: - Internet Reachability Check with Retry
 
     private func checkInternetAvailability(retries: Int, completion: @escaping (Bool) -> Void) {
-        let url = URL(string: "https://www.google.com/generate_204")!
+        guard let url = URL(string: "https://www.google.com/generate_204") else {
+            completion(false)
+            return
+        }
+
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
         request.httpMethod = "HEAD"
 
         if enableDebugLogging {
-            print("[MRReachability] Performing internet check (\(retryAttempts - retries + 1)/\(retryAttempts))")
+            print("[MRReachability] 🌐 Checking internet... Attempt \(retryAttempts - retries + 1)")
         }
 
-        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            let success: Bool
+
             if let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 204 {
-                completion(true)
+                success = true
+            } else if let data = data, !data.isEmpty {
+                success = true
             } else {
-                if retries > 0 {
-                    DispatchQueue.global().asyncAfter(deadline: .now() + self!.retryBackoff) {
-                        self?.checkInternetAvailability(retries: retries - 1, completion: completion)
+                success = false
+            }
+
+            if success {
+                DispatchQueue.main.async {
+                    if self?.enableDebugLogging == true {
+                        print("[MRReachability] ✅ Internet is reachable.")
                     }
-                } else {
+                    completion(true)
+                }
+            } else if retries > 0 {
+                DispatchQueue.global().asyncAfter(deadline: .now() + (self?.retryBackoff ?? 1)) {
+                    self?.checkInternetAvailability(retries: retries - 1, completion: completion)
+                }
+            } else {
+                DispatchQueue.main.async {
+                    if self?.enableDebugLogging == true {
+                        print("[MRReachability] ❌ Internet check failed after all retries.")
+                    }
                     completion(false)
                 }
             }
         }.resume()
     }
 
-    // MARK: - Internals
-
-    private let monitor: NWPathMonitor
-    private let queue: DispatchQueue
-
-    private var notifierRunning: Bool = false
-    private var lastStatus: Connection?
-    private var lastNotifiedStatus: Connection?
-    private var debounceWorkItem: DispatchWorkItem?
-    private var host: String?
+    // MARK: - Utility
 
     private static func map(path: NWPath, allowsCellular: Bool) -> Connection {
         guard path.status == .satisfied else { return .unavailable }
@@ -207,4 +249,4 @@ public final class MRReachability: @unchecked Sendable, CustomStringConvertible 
         }
         return .unavailable
     }
-}  // End
+}

@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name         = 'MRReachability'
-  s.version      = '1.0.3'
+  s.version      = '1.0.4'
   s.summary      = 'Modern reachability wrapper using NWPathMonitor.'
   s.description  = <<-DESC
     MRReachability is a lightweight, NWPathMonitor-based reachability utility
